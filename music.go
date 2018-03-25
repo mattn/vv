@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/meiraka/gompd/mpd"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +14,19 @@ import (
 const (
 	playlistLength = 9999
 )
+
+var tagTypes = map[string]string{
+	".flac": "Vorbis",
+}
+
+var tagMappings = map[string]map[string]string{
+	"Vorbis": {
+		"LYRICIST":      "Lyricist",
+		"ARRANGER":      "Arranger",
+		"CATALOGNUMBER": "CatalogNumber",
+		"MEDIA":         "Media",
+	},
+}
 
 /*Dial Connects to mpd server.*/
 func Dial(network, addr, passwd, musicDirectory string) (*Music, error) {
@@ -49,6 +64,7 @@ type Music struct {
 	playlistSortUpdate time.Time
 	outputs            sliceMapStorage
 	notification       pubsub
+	commentsCache      map[string]Song
 }
 
 /*Close mpd connection.*/
@@ -260,6 +276,7 @@ type mpdClient interface {
 	Repeat(bool) error
 	Single(bool) error
 	Random(bool) error
+	ReadCommentsTags(string) (mpd.Tags, error)
 	CurrentSongTags() (mpd.Tags, error)
 	Status() (mpd.Attrs, error)
 	Stats() (mpd.Attrs, error)
@@ -275,6 +292,7 @@ type mpdClient interface {
 type mpdClientCommandList interface {
 	Clear()
 	Add(string)
+	ReadCommentsTags(string) *mpd.PromisedTags
 	End() error
 }
 
@@ -285,6 +303,7 @@ func (p *Music) initIfNot() error {
 		p.daemonStop = make(chan bool)
 		p.daemonRequest = make(chan *musicMessage)
 		p.coverCache = make(map[string]string)
+		p.commentsCache = make(map[string]Song)
 		mpc, watcher := p.connect()
 		go p.run(mpc, watcher)
 	}
@@ -412,6 +431,7 @@ func (p *Music) updateCurrentSong(mpc mpdClient) error {
 	if len(current["file"]) == 0 || current["file"][0] != tags["file"][0] {
 		p.mutex.Lock()
 		song := MakeSong(tags, p.musicDirectory, "cover.*", p.coverCache)
+		song = p.addCommentsToSong(mpc, song)
 		p.mutex.Unlock()
 		p.current.set(song, time.Now().UTC())
 		return p.notify("current")
@@ -445,15 +465,123 @@ func (p *Music) updateLibrary(mpc mpdClient) error {
 	}
 	p.mutex.Lock()
 	library := MakeSongs(libraryTags, p.musicDirectory, "cover.*", p.coverCache)
+	library = p.addCommentsToSongs(mpc, library)
 	p.mutex.Unlock()
 	for i := range library {
 		library[i]["Pos"] = []string{strconv.Itoa(i)}
 	}
+
 	librarySort := make([]Song, len(library))
 	copy(librarySort, library)
 	p.library.set(library, time.Now().UTC())
 	p.librarySort.set(librarySort, time.Now().UTC())
 	return p.notify("library")
+}
+
+type typePromisedTags struct {
+	path         string
+	lastModified []string
+	tagType      string
+	tag          *mpd.PromisedTags
+}
+
+func (p *Music) addCommentsToSong(mpc mpdClient, song Song) Song {
+	f, fok := song["file"]
+	l, lok := song["Last-Modified"]
+	if !fok || !lok || len(f) != 1 || len(l) != 1 {
+		// invalid song map
+		return song
+	}
+	tagType, ok := tagTypes[path.Ext(f[0])]
+	if !ok {
+		return song
+	}
+	c, cok := p.commentsCache[f[0]]
+	if !cok || c["Last-Modified"][0] != l[0] {
+		t, err := mpc.ReadCommentsTags(f[0])
+		if err != nil {
+			return song
+		}
+		c := Song{"Last-Modified": l}
+		tagMapping := tagMappings[tagType]
+		for k, v := range t {
+			k = strings.ToUpper(k)
+			target, ok := tagMapping[k]
+			if ok {
+				c[target] = v
+			}
+		}
+		p.commentsCache[f[0]] = c
+	}
+	for k, v := range c {
+		song[k] = v
+	}
+	return song
+}
+func (p *Music) addCommentsToSongs(mpc mpdClient, songs []Song) []Song {
+	cl := musicMpdBeginCommandList(mpc)
+	comments := make([]*typePromisedTags, len(songs))
+	for i, song := range songs {
+		f, fok := song["file"]
+		l, lok := song["Last-Modified"]
+		if !fok || !lok || len(f) != 1 || len(l) != 1 {
+			// invalid song map
+			continue
+		}
+		tagType, ok := tagTypes[path.Ext(f[0])]
+		if !ok {
+			// unsupported file type
+			continue
+		}
+		c, cok := p.commentsCache[f[0]]
+		if cok {
+			if c["Last-Modified"][0] == l[0] {
+				// found in cache
+				continue
+			}
+		}
+		comments[i] = &typePromisedTags{
+			path:         f[0],
+			lastModified: l,
+			tagType:      tagType,
+			tag:          cl.ReadCommentsTags(f[0]),
+		}
+	}
+	cl.End()
+	for _, tags := range comments {
+		if tags == nil || tags.tag == nil {
+			continue
+		}
+		t, err := tags.tag.Value()
+		if err != nil {
+			continue
+		}
+		ret := Song{"Last-Modified": tags.lastModified}
+		tagMapping := tagMappings[tags.tagType]
+		for k, v := range t {
+			k = strings.ToUpper(k)
+			target, ok := tagMapping[k]
+			if ok {
+				ret[target] = v
+			}
+		}
+		p.commentsCache[tags.path] = ret
+	}
+	for _, song := range songs {
+		f, fok := song["file"]
+		if !fok || len(f) != 1 {
+			// invalid song map
+			continue
+		}
+		c, cok := p.commentsCache[f[0]]
+		if !cok {
+			continue
+		}
+		for k, v := range c {
+			song[k] = v
+		}
+	}
+	return songs
 }
 
 func (p *Music) updatePlaylist(mpc mpdClient) error {
