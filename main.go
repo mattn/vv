@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/mod/semver"
+
 	"github.com/meiraka/vv/internal/mpd"
 	"github.com/meiraka/vv/internal/songs/cover"
 )
@@ -115,7 +117,7 @@ func v2() {
 		}
 	}
 	if config.Server.Cover.Remote {
-		if !contains(commands, "albumart") {
+		if semver.Compare("v"+cl.Version(), "v0.20.1") < 0 || !contains(commands, "albumart") {
 			log.Println("config.server.cover.remote is disabled: mpd does not support albumart command")
 		} else {
 			c, err := cover.NewRemote("/api/music/images/remote/", cl, filepath.Join(config.Server.CacheDirectory, "imgcache"))
